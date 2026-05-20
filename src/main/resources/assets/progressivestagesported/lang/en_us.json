@@ -1,0 +1,19 @@
+{
+  "progressivestagesported.locked": "🔒 Locked",
+  "progressivestagesported.stage_required": "Stage required: %s",
+  "progressivestagesported.current_stage": "Current stage: %s",
+  "progressivestagesported.progress": "Progress: %s",
+  "progressivestagesported.message.locked_item": "§c🔒 You haven't unlocked this item yet!",
+  "progressivestagesported.message.locked_recipe": "§c🔒 This recipe is locked!",
+  "progressivestagesported.message.locked_block": "§c🔒 This block is locked!",
+  "progressivestagesported.message.locked_dimension": "§c🔒 This dimension is locked!",
+  "progressivestagesported.command.grant_success": "Granted stage %s to %s",
+  "progressivestagesported.command.revoke_success": "Revoked stage %s from %s",
+  "progressivestagesported.command.stage_not_found": "Stage not found: %s",
+  "progressivestagesported.command.reload_success": "Reloaded stage definitions",
+
+  "progressivestagesported.quest.required_stage": "Stage Required",
+  "progressivestagesported.quest.required_stage.tooltip": "If set, this quest is hidden until the player has this stage. Leave empty for no requirement. Example: iron_age or progressivestagesported:diamond_age",
+  "progressivestagesported.chapter.required_stage": "Stage Required",
+  "progressivestagesported.chapter.required_stage.tooltip": "If set, this entire chapter is hidden until the player has this stage. Leave empty for no requirement. Example: iron_age or progressivestagesported:diamond_age"
+}

@@ -1,0 +1,398 @@
+package com.enviouse.progressivestagesported.server;
+
+import com.enviouse.progressivestagesported.common.config.StageConfig;
+import com.enviouse.progressivestagesported.common.network.NetworkHandler;
+import com.enviouse.progressivestagesported.common.stage.StageManager;
+import com.enviouse.progressivestagesported.common.team.TeamProvider;
+import com.enviouse.progressivestagesported.common.team.TeamStageSync;
+import com.enviouse.progressivestagesported.common.util.Constants;
+import com.enviouse.progressivestagesported.server.commands.StageCommand;
+import com.enviouse.progressivestagesported.server.enforcement.*;
+import com.enviouse.progressivestagesported.server.loader.StageFileLoader;
+import com.enviouse.progressivestagesported.server.triggers.*;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.Block;
+import net.neoforged.bus.api.EventPriority;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
+import net.neoforged.neoforge.event.entity.living.LivingEntityUseItemEvent;
+import net.neoforged.neoforge.event.entity.player.ItemEntityPickupEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
+import net.neoforged.neoforge.event.level.BlockEvent;
+import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.tick.PlayerTickEvent;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Main event handler for server-side events
+ */
+@EventBusSubscriber(modid = Constants.MOD_ID)
+public class ServerEventHandler {
+
+    // Track last inventory scan time per player (for scan frequency)
+    private static final Map<UUID, Long> lastScanTime = new HashMap<>();
+
+    @SubscribeEvent
+    public static void onServerStarting(ServerStartingEvent event) {
+        // Initialize team provider
+        TeamProvider.getInstance().initialize();
+
+        // Initialize stage manager
+        StageManager.getInstance().initialize(event.getServer());
+
+        // Initialize team stage sync
+        TeamStageSync.initialize(event.getServer());
+
+        // Load stage files
+        StageFileLoader.getInstance().initialize(event.getServer());
+
+        // Load trigger config and register trigger event handlers
+        TriggerConfigLoader.loadTriggerConfig();
+        NeoForge.EVENT_BUS.register(AdvancementStageGrants.class);
+        NeoForge.EVENT_BUS.register(ItemPickupStageGrants.class);
+        NeoForge.EVENT_BUS.register(DimensionStageGrants.class);
+        NeoForge.EVENT_BUS.register(BossKillStageGrants.class);
+
+        // Initialize FTB Teams integration (soft dependency)
+        // Uses reflection to avoid loading FTBTeamsIntegration class (which imports FTB Teams API)
+        // when FTB Teams is not installed — any direct class reference would cause NoClassDefFoundError
+        if (net.neoforged.fml.ModList.get().isLoaded("ftbteams") && StageConfig.isFtbTeamsIntegrationEnabled()) {
+            try {
+                Class<?> ftbTeamsIntClass = Class.forName(
+                    "com.enviouse.progressivestagesported.server.integration.FTBTeamsIntegration");
+                ftbTeamsIntClass.getMethod("registerIfAvailable").invoke(null);
+            } catch (ClassNotFoundException | NoClassDefFoundError e) {
+                com.mojang.logging.LogUtils.getLogger().warn(
+                    "[ProgressiveStages] FTB Teams classes not available, skipping team integration: {}", e.getMessage());
+            } catch (Exception e) {
+                com.mojang.logging.LogUtils.getLogger().warn(
+                    "[ProgressiveStages] Failed to initialize FTB Teams integration: {}", e.getMessage());
+            }
+        }
+
+        // Initialize FTB Quests compatibility (soft dependency)
+        // FTB Quests compatibility removed for MC 26.1.2 port
+    }
+
+    @SubscribeEvent
+    public static void onRegisterCommands(RegisterCommandsEvent event) {
+        StageCommand.register(event.getDispatcher());
+    }
+
+    @SubscribeEvent
+    public static void onPlayerJoin(EntityJoinLevelEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            // Sync stages to player on login (fires bulk event for FTB Quests)
+            StageManager.getInstance().syncStagesOnLogin(player);
+
+            // Send stage definitions to client first (v1.3 - includes dependencies)
+            NetworkHandler.sendStageDefinitionsSync(player);
+
+            // Sync lock registry to player BEFORE stage data so that when EMI reload
+            // fires on stage sync arrival, ClientLockCache is already populated.
+            NetworkHandler.sendLockSync(player);
+
+            // Send stage data to client (triggers EMI reload on arrival)
+            var stages = StageManager.getInstance().getStages(player);
+            NetworkHandler.sendStageSync(player, stages);
+
+            // Send initial creative bypass state
+            if (StageConfig.isAllowCreativeBypass() && player.isCreative()) {
+                NetworkHandler.sendCreativeBypass(player, true);
+            }
+        }
+    }
+
+    // ============ Gamemode Change Handling ============
+
+    @SubscribeEvent
+    public static void onGameModeChange(PlayerEvent.PlayerChangeGameModeEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            if (!StageConfig.isAllowCreativeBypass()) {
+                return; // Creative bypass disabled in config
+            }
+
+            GameType newMode = event.getNewGameMode();
+            GameType oldMode = event.getCurrentGameMode();
+
+            if (newMode == GameType.CREATIVE && oldMode != GameType.CREATIVE) {
+                // Entering creative mode - enable bypass on client
+                NetworkHandler.sendCreativeBypass(player, true);
+            } else if (newMode != GameType.CREATIVE && oldMode == GameType.CREATIVE) {
+                // Leaving creative mode - disable bypass on client
+                NetworkHandler.sendCreativeBypass(player, false);
+            }
+        }
+    }
+
+    // ============ Crafting Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onItemCrafted(PlayerEvent.ItemCraftedEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            // Check if the crafted item is locked
+            if (!ItemEnforcer.canHoldItem(player, event.getCrafting())) {
+                // Remove the crafted item — the player shouldn't have it
+                event.getCrafting().setCount(0);
+                ItemEnforcer.notifyLocked(player, event.getCrafting().getItem());
+                return;
+            }
+
+            // Check recipe-only lock (item is not locked but the specific recipe is).
+            // ResultSlotMixin is the primary gate (blocks mayPickup), but this is a backstop
+            // for crafting paths that bypass the mixin (e.g., recipe book, auto-crafters).
+            if (!event.getCrafting().isEmpty() &&
+                    event.getInventory() instanceof net.minecraft.world.inventory.CraftingContainer craftingContainer) {
+
+                // Check recipe_items lock (locks ALL recipes for this output item)
+                if (RecipeEnforcer.isOutputItemRecipeLocked(player, event.getCrafting().getItem())) {
+                    RecipeEnforcer.notifyOutputLocked(player, event.getCrafting().getItem());
+                    event.getCrafting().setCount(0);
+                    return;
+                }
+
+                // Check recipes lock (locks ONE specific recipe by ID).
+                // Primary: use the recipe ID stored by CraftingMenuMixin (most reliable).
+                // Fallback: do a recipe lookup (for paths that bypass the mixin).
+                net.minecraft.resources.Identifier recipeId =
+                        com.enviouse.progressivestagesported.common.util.CraftingRecipeTracker.getLastRecipe(player.getUUID());
+                if (recipeId == null) {
+                    var server = player.level().getServer();
+                    if (server != null) {
+                        var found = server.getRecipeManager()
+                                .getRecipeFor(net.minecraft.world.item.crafting.RecipeType.CRAFTING,
+                                        craftingContainer.asCraftInput(), player.level());
+                        if (found.isPresent()) {
+                            recipeId = found.get().id().identifier();
+                        }
+                    }
+                }
+                if (recipeId != null && RecipeEnforcer.isRecipeLockedForPlayer(player, recipeId)) {
+                    RecipeEnforcer.notifyLocked(player, recipeId);
+                    event.getCrafting().setCount(0);
+                }
+            }
+        }
+    }
+
+    // ============ Item Use Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onItemUse(PlayerInteractEvent.RightClickItem event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            if (!ItemEnforcer.canUseItem(player, event.getItemStack())) {
+                event.setCanceled(true);
+                ItemEnforcer.notifyLockedWithCooldown(player, event.getItemStack().getItem());
+            }
+        }
+    }
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onItemStartUse(LivingEntityUseItemEvent.Start event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            if (!ItemEnforcer.canUseItem(player, event.getItem())) {
+                event.setCanceled(true);
+                ItemEnforcer.notifyLockedWithCooldown(player, event.getItem().getItem());
+            }
+        }
+    }
+
+    // ============ Left-Click / Mining Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onLeftClickBlock(PlayerInteractEvent.LeftClickBlock event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            // Block mining/breaking when the held tool/item is locked
+            if (!event.getItemStack().isEmpty() && !ItemEnforcer.canUseItem(player, event.getItemStack())) {
+                event.setCanceled(true);
+                ItemEnforcer.notifyLockedWithCooldown(player, event.getItemStack().getItem());
+            }
+        }
+    }
+
+    // ============ Item Pickup Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onItemPickup(ItemEntityPickupEvent.Pre event) {
+        if (event.getPlayer() instanceof ServerPlayer player) {
+            ItemEntity itemEntity = event.getItemEntity();
+            if (!ItemEnforcer.canPickupItem(player, itemEntity.getItem())) {
+                event.setCanPickup(net.minecraft.util.TriState.FALSE);
+                // Use cooldown system to prevent chat spam
+                ItemEnforcer.notifyLockedWithCooldown(player, itemEntity.getItem().getItem());
+            }
+        }
+    }
+
+    // ============ Inventory Scanning ============
+
+    @SubscribeEvent
+    public static void onPlayerTick(PlayerTickEvent.Post event) {
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
+            return;
+        }
+
+        int scanFrequency = StageConfig.getInventoryScanFrequency();
+        if (scanFrequency <= 0) {
+            return;
+        }
+
+        UUID playerId = player.getUUID();
+        long currentTime = player.level().getGameTime();
+        Long lastScan = lastScanTime.get(playerId);
+
+        if (lastScan == null || currentTime - lastScan >= scanFrequency) {
+            lastScanTime.put(playerId, currentTime);
+
+            // Full inventory drop takes priority over hotbar-only move
+            if (StageConfig.isBlockItemInventory()) {
+                InventoryScanner.scanAndDropLockedItems(player);
+            } else if (StageConfig.isBlockItemHotbar()) {
+                InventoryScanner.scanAndMoveLockedItemsFromHotbar(player);
+            }
+        }
+    }
+
+    // ============ Block Placement Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onBlockPlace(BlockEvent.EntityPlaceEvent event) {
+        Entity entity = event.getEntity();
+        if (entity instanceof ServerPlayer player) {
+            Block block = event.getPlacedBlock().getBlock();
+            if (!BlockEnforcer.canPlaceBlock(player, block)) {
+                event.setCanceled(true);
+                BlockEnforcer.notifyPlacementLocked(player, block);
+            }
+        }
+    }
+
+    // ============ Block Interaction Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onBlockInteract(PlayerInteractEvent.RightClickBlock event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            Block block = event.getLevel().getBlockState(event.getPos()).getBlock();
+
+            // Check if block interaction is locked
+            if (!BlockEnforcer.canInteractWithBlock(player, block)) {
+                event.setCanceled(true);
+                BlockEnforcer.notifyInteractionLocked(player, block);
+                return;
+            }
+
+            // Check interaction locks (item-on-block, Create-style interactions)
+            if (!InteractionEnforcer.canInteract(player, event.getItemStack(), block)) {
+                event.setCanceled(true);
+                InteractionEnforcer.notifyLocked(player, event.getItemStack(), block);
+                return;
+            }
+
+            // Also check if the held item is locked (for item-on-block interactions)
+            if (!event.getItemStack().isEmpty()) {
+                if (!ItemEnforcer.canUseItem(player, event.getItemStack())) {
+                    event.setCanceled(true);
+                    ItemEnforcer.notifyLocked(player, event.getItemStack().getItem());
+                    return;
+                }
+
+                // Check if trying to place a locked block
+                if (event.getItemStack().getItem() instanceof BlockItem blockItem) {
+                    if (!BlockEnforcer.canPlaceBlock(player, blockItem.getBlock())) {
+                        event.setCanceled(true);
+                        BlockEnforcer.notifyPlacementLocked(player, blockItem.getBlock());
+                    }
+                }
+            }
+        }
+    }
+
+    // ============ Dimension Travel Enforcement ============
+
+    /**
+     * Primary gate: cancels dimension travel BEFORE it happens.
+     * Works for all teleportation that goes through Entity.changeDimension().
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onDimensionTravel(net.neoforged.neoforge.event.entity.EntityTravelToDimensionEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            // Always save the player's current position so the safety net can use it
+            DimensionEnforcer.savePositionBeforeTravel(player);
+
+            if (!DimensionEnforcer.canTravelToDimension(player, event.getDimension())) {
+                event.setCanceled(true);
+                DimensionEnforcer.notifyLocked(player, event.getDimension().identifier());
+            }
+        }
+    }
+
+    /**
+     * Safety net: catches dimension changes that bypassed the pre-travel event.
+     * Some mods (e.g., Twilight Forest) use custom teleportation mechanisms that
+     * may not fire EntityTravelToDimensionEvent. This handler detects the player
+     * is now in a locked dimension and teleports them back.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onDimensionChanged(PlayerEvent.PlayerChangedDimensionEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            DimensionEnforcer.handlePostTravelSafetyNet(player, event.getFrom(), event.getTo());
+        }
+    }
+
+    // ============ Entity Interaction Enforcement (item_on_entity) ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onEntityInteract(PlayerInteractEvent.EntityInteract event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            var entityType = event.getTarget().getType();
+            if (!InteractionEnforcer.canInteractWithEntity(player, event.getItemStack(), entityType)) {
+                event.setCanceled(true);
+                InteractionEnforcer.notifyEntityInteractionLocked(player, event.getItemStack(), entityType);
+            }
+        }
+    }
+
+    // ============ Entity Attack Enforcement ============
+
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public static void onAttackEntity(net.neoforged.neoforge.event.entity.player.AttackEntityEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            // Check if the entity type is locked
+            if (!EntityEnforcer.canAttackEntity(player, event.getTarget().getType())) {
+                event.setCanceled(true);
+                EntityEnforcer.notifyLocked(player, event.getTarget().getType());
+                return;
+            }
+
+            // Also check if the held weapon/item is locked (can't attack with a locked sword, etc.)
+            var heldItem = player.getMainHandItem();
+            if (!heldItem.isEmpty() && !ItemEnforcer.canUseItem(player, heldItem)) {
+                event.setCanceled(true);
+                ItemEnforcer.notifyLockedWithCooldown(player, heldItem.getItem());
+            }
+        }
+    }
+
+    // ============ Cleanup ============
+
+    @SubscribeEvent
+    public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            lastScanTime.remove(player.getUUID());
+            ItemEnforcer.clearCooldowns(player.getUUID());
+            DimensionEnforcer.cleanupPlayer(player.getUUID());
+        }
+    }
+}
